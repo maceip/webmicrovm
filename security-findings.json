@@ -1,0 +1,78 @@
+[
+  {
+    "severity": "high",
+    "location": "src/vmm/src/devices/virtio/vsock/persist.rs",
+    "title": "Vsock uds_path injection via malicious snapshot allows arbitrary Unix socket binding",
+    "description": "During vsock backend restoration from a snapshot, the `uds_path` field is deserialized from untrusted snapshot data and passed directly to `VsockUnixBackend::new()`, which calls `UnixListener::bind(&host_sock_path)` without any path sanitization or validation. Unlike the normal API path where the UDS path comes from a validated API request, the snapshot restore path accepts any arbitrary string as a filesystem path.",
+    "impact": "An attacker who can supply a crafted snapshot can bind a Unix domain socket at any filesystem path writable by the Firecracker process. This can: (1) overwrite existing Unix sockets used by other services, causing denial of service; (2) create sockets in sensitive locations to intercept IPC communications; (3) if Firecracker runs with elevated permissions, create sockets in privileged directories. The socket will be actively listening for vsock connections, creating an unexpected network endpoint on the host.",
+    "attack_path": "1. Attacker creates a valid Firecracker snapshot. 2. Attacker modifies the serialized VsockBackendState to set uds_path to a target path (e.g., '/var/run/docker.sock' or '/tmp/target-service.sock'). 3. Victim loads the crafted snapshot via Firecracker's snapshot restore API. 4. VsockUnixBackend::restore() calls Self::new(constructor_args.cid, state.uds_path.clone()). 5. VsockUnixBackend::new() calls UnixListener::bind(&host_sock_path) with the attacker-controlled path. 6. A Unix socket is created and bound at the attacker-specified path on the host filesystem.",
+    "evidence": [
+      "src/vmm/src/devices/virtio/vsock/persist.rs:73-78 - VsockUnixBackend::restore() passes state.uds_path directly to Self::new()",
+      "src/vmm/src/devices/virtio/vsock/unix/muxer.rs:308-331 - VsockUnixBackend::new() calls UnixListener::bind(&host_sock_path) with no sanitization",
+      "src/vmm/src/devices/virtio/vsock/persist.rs:38-43 - VsockBackendState.uds_path is deserialized from untrusted snapshot data"
+    ],
+    "remediation": "Validate the restored `uds_path` against an allowlist or enforce that it matches the original socket path configured via the API. At minimum, reject paths containing '..' components, absolute paths to sensitive directories, or paths that already exist as non-socket files. Consider storing and comparing a cryptographic hash of the original uds_path in the snapshot metadata."
+  },
+  {
+    "severity": "high",
+    "location": "src/vmm/src/devices/virtio/net/persist.rs",
+    "title": "Network TAP interface name injection via malicious snapshot allows host network hijacking",
+    "description": "During network device restoration from a snapshot, the `tap_if_name` field is deserialized from untrusted snapshot data and passed directly to `Net::new()`, which calls `Tap::open_named(tap_if_name)`. This function opens /dev/net/tun and issues an ioctl to attach to the named TAP interface. While the interface name is length-checked (must be < IFACE_NAME_MAX_LEN), no content validation is performed. A crafted snapshot can specify any existing TAP interface name on the host.",
+    "impact": "An attacker who can supply a crafted snapshot can hijack any existing TAP interface on the host that the Firecracker process has permission to access. This enables: (1) attaching to a TAP device belonging to another microVM, gaining the ability to inject/intercept its network traffic; (2) attaching to a TAP device used by host networking, potentially intercepting host traffic; (3) denial of service by stealing a TAP device from another running microVM. The IFF_TAP flag with IFF_NO_PI means the attacker gets raw Ethernet frame access.",
+    "attack_path": "1. Attacker observes or guesses TAP interface names used by other microVMs (e.g., 'fc_tap0', 'vmtap1'). 2. Attacker creates a valid Firecracker snapshot. 3. Attacker modifies the serialized NetState to set tap_if_name to a target interface name. 4. Victim loads the crafted snapshot via Firecracker's snapshot restore API. 5. Net::restore() calls Net::new(state.id.clone(), &state.tap_if_name, ...). 6. Net::new() calls Tap::open_named(tap_if_name) which opens /dev/net/tun and attaches to the specified interface. 7. The restored microVM now sends/receives traffic through the hijacked TAP interface.",
+    "evidence": [
+      "src/vmm/src/devices/virtio/net/persist.rs:99-106 - Net::restore() passes state.tap_if_name directly to Net::new()",
+      "src/vmm/src/devices/virtio/net/device.rs:344-358 - Net::new() calls Tap::open_named(tap_if_name) with no content validation",
+      "src/vmm/src/devices/virtio/net/tap.rs:120-140 - Tap::open_named() opens /dev/net/tun and attaches to the named interface via ioctl",
+      "src/vmm/src/devices/virtio/net/tap.rs:58-71 - build_terminated_if_name() only checks length, not content"
+    ],
+    "remediation": "Validate the restored tap_if_name against the original interface name that was configured via the API. Store and verify the expected TAP interface name in a trusted metadata store rather than relying on the snapshot content. Alternatively, always create a new TAP interface during restore rather than attaching to an existing one by name."
+  },
+  {
+    "severity": "medium",
+    "location": "src/vmm/src/devices/virtio/persist.rs",
+    "title": "MMIO transport device_status restored from snapshot bypasses virtio state machine validation",
+    "description": "The MmioTransport::restore() function directly assigns the `device_status` field from the deserialized snapshot state without passing it through `set_device_status()`, which enforces the VirtIO specification's device status state machine (Section 2.1.1 and 3.1.1). The state machine requires transitions to follow a strict sequence: INIT -> ACKNOWLEDGE -> DRIVER -> FEATURES_OK -> DRIVER_OK. By bypassing this validation, a crafted snapshot can set device_status to any arbitrary 32-bit value.",
+    "impact": "A crafted device_status value can create an inconsistent state between the MMIO transport layer and the underlying virtio device. Specifically: (1) Setting device_status to FEATURES_OK without DRIVER_OK while the device is activated allows the guest to modify queue descriptor table addresses, available ring addresses, and used ring addresses via MMIO writes (through update_queue_field), which should be immutable after activation; (2) Setting device_status to DRIVER without FEATURES_OK allows the guest to re-acknowledge features and write to device config space on an already-activated device; (3) The guest sees an inconsistent state that could trigger undefined behavior in guest drivers.",
+    "attack_path": "1. Attacker creates a valid Firecracker snapshot with an activated virtio device. 2. Attacker modifies the serialized MmioTransportState.device_status to a value like 0x08 (FEATURES_OK only). 3. Victim loads the crafted snapshot. 4. MmioTransport::restore() directly assigns transport.device_status = state.device_status (line 248), bypassing set_device_status() state machine validation. 5. Post-restore, the guest writes to MMIO offset 0x80 (QueueDescLow) - update_queue_field checks check_device_status(FEATURES_OK, DRIVER_OK|FAILED) which passes because FEATURES_OK is set but DRIVER_OK is not. 6. Queue GuestAddress fields are modified on an already-initialized device, creating inconsistency between the queue's GPA fields and its active HVA pointers.",
+    "evidence": [
+      "src/vmm/src/devices/virtio/persist.rs:235-255 - MmioTransport::restore() directly assigns device_status without validation",
+      "src/vmm/src/devices/virtio/transport/mmio.rs:130-142 - update_queue_field() uses check_device_status() which is gated by the restorable device_status",
+      "src/vmm/src/devices/virtio/transport/mmio.rs:169-235 - set_device_status() implements the state machine that is bypassed",
+      "src/vmm/src/devices/virtio/transport/mmio.rs:315-329 - Feature acknowledgment is gated by device_status"
+    ],
+    "remediation": "Validate the restored device_status against the set of valid state machine values before assigning it. At minimum, verify that the restored status corresponds to a reachable state (e.g., one of the valid transition endpoints in VALID_TRANSITIONS). Additionally, if the underlying device reports is_activated()==true, enforce that device_status includes DRIVER_OK to maintain consistency."
+  },
+  {
+    "severity": "medium",
+    "location": "src/vmm/src/devices/virtio/net/persist.rs",
+    "title": "Virtio avail_features overwritten from untrusted snapshot enables unsupported feature negotiation",
+    "description": "When restoring virtio devices (net, balloon, block, vsock), the `avail_features` and `acked_features` fields are directly overwritten from deserialized snapshot data after the device constructor has computed the correct available features based on actual hardware/software capabilities. While build_queues_checked() validates that acked_features is a subset of avail_features, both values come from the same untrusted snapshot, making this check ineffective against a coordinated modification. The device constructor's carefully computed feature set is silently discarded.",
+    "impact": "A crafted snapshot can claim the device supports arbitrary virtio features that it does not actually support. This affects runtime code paths: (1) For net devices, VIRTIO_NET_F_MRG_RXBUF changes RX buffer sizing (minimum_rx_buffer_size) and TAP read behavior (single_chain vs all_chains in read_tap); (2) Feature flags control TAP offload configuration via build_tap_offload_features() during activation, potentially enabling offloads the TAP doesn't support; (3) VIRTIO_RING_F_EVENT_IDX controls notification suppression, and fraudulently enabling it could cause missed interrupts or spurious notifications; (4) For balloon, VIRTIO_BALLOON_F_FREE_PAGE_HINTING and VIRTIO_BALLOON_F_FREE_PAGE_REPORTING change queue count and enable additional queue processing paths.",
+    "attack_path": "1. Attacker creates a valid Firecracker snapshot of a net device. 2. Attacker modifies VirtioDeviceState.avail_features and acked_features to include VIRTIO_NET_F_MRG_RXBUF (which was not originally negotiated). 3. Victim loads the crafted snapshot. 4. Net::restore() creates the device via Net::new() which computes correct avail_features. 5. Line 131: net.avail_features = state.virtio_state.avail_features overwrites with crafted value. 6. Line 132: net.acked_features = state.virtio_state.acked_features overwrites with crafted value. 7. build_queues_checked validates acked ⊆ avail, which passes since both are crafted. 8. On device activation, minimum_rx_buffer_size() returns vnet_hdr_len (12 bytes) instead of 1526 bytes, and read_tap() uses all_chains_slice_mut() instead of single_chain_slice_mut(), changing data plane behavior.",
+    "evidence": [
+      "src/vmm/src/devices/virtio/net/persist.rs:131-132 - avail_features and acked_features directly overwritten from snapshot",
+      "src/vmm/src/devices/virtio/balloon/persist.rs:180-181 - Same pattern in balloon restore",
+      "src/vmm/src/devices/virtio/vsock/persist.rs:114-115 - Same pattern in vsock restore",
+      "src/vmm/src/devices/virtio/persist.rs:156-158 - build_queues_checked validates acked ⊆ avail, but both from same untrusted source",
+      "src/vmm/src/devices/virtio/net/device.rs:469-482 - minimum_rx_buffer_size() behavior depends on VIRTIO_NET_F_MRG_RXBUF feature flag",
+      "src/vmm/src/devices/virtio/net/device.rs:866-873 - read_tap() behavior changes based on VIRTIO_NET_F_MRG_RXBUF"
+    ],
+    "remediation": "After device construction during restore, validate the snapshot's avail_features against the device's freshly computed avail_features. Either reject snapshots where avail_features differs from what the device constructor produced, or always use the device constructor's computed avail_features and only restore acked_features (validating it's a subset of the constructor-computed avail_features). This ensures feature flags always reflect actual device capabilities."
+  },
+  {
+    "severity": "medium",
+    "location": "src/vmm/src/devices/virtio/vsock/persist.rs",
+    "title": "Vsock CID restored from snapshot without validation against reserved values or type bounds",
+    "description": "The vsock Context Identifier (CID) is restored directly from the snapshot's VsockFrontendState.cid (a u64) into the Vsock device without any validation. The normal API path accepts guest_cid as a u32 (via VsockDeviceConfig), but the snapshot persistence layer stores and restores it as a u64. This means a crafted snapshot can specify CID values that are impossible through the normal API (values > u32::MAX) and values that are reserved by the vsock specification: CID 0 (hypervisor), CID 1 (local/loopback), and CID 2 (host). No validation is performed at any point in the restore chain.",
+    "impact": "A crafted snapshot can assign a reserved CID to the guest VM: (1) CID 2 (VMADDR_CID_HOST) would cause the guest to impersonate the host in vsock communications, potentially allowing it to receive connections intended for the host; (2) CID 0 or 1 could cause undefined behavior in the vsock transport layer; (3) CID values > u32::MAX bypass the u32 constraint enforced by the API, potentially causing truncation or unexpected behavior when the CID is used in 32-bit contexts (e.g., VsockDeviceConfig conversion calls u32::try_from(cid) which would panic). This represents both a privilege confusion vulnerability and a type safety bypass.",
+    "attack_path": "1. Attacker creates a valid Firecracker snapshot with a vsock device. 2. Attacker modifies VsockFrontendState.cid to value 2 (VMADDR_CID_HOST) in the serialized snapshot. 3. Victim loads the crafted snapshot. 4. Vsock::restore() calls Self::with_queues(state.cid, ...) with cid=2. 5. with_queues() stores the CID without validation (device.rs:97-120). 6. The guest's vsock device now identifies as CID 2 (host), and read_config returns CID 2 to the guest driver. 7. Guest vsock communications use CID 2 as source, potentially being routed as host-originated traffic by the vsock transport.",
+    "evidence": [
+      "src/vmm/src/devices/virtio/vsock/persist.rs:98-118 - Vsock::restore() uses state.cid directly without validation",
+      "src/vmm/src/devices/virtio/vsock/device.rs:97-120 - with_queues() stores cid without any range or reserved value check",
+      "src/vmm/src/vmm_config/vsock.rs:32 - Normal API path restricts guest_cid to u32, but snapshot stores u64",
+      "src/vmm/src/vmm_config/vsock.rs:48 - u32::try_from(vsock_lock.cid()) would panic if cid > u32::MAX"
+    ],
+    "remediation": "Add CID validation in the vsock restore path that: (1) rejects reserved CID values 0, 1, and 2 as defined by the vsock specification; (2) validates the CID fits within u32 range to match the API constraint; (3) optionally validates the CID matches the originally configured value stored in trusted metadata. Apply the same validation in VsockUnixBackend::new() to also protect the normal creation path."
+  }
+]
